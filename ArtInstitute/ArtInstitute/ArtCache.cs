@@ -7,7 +7,7 @@ public class ArtCache
     private readonly int maxSize;
     private readonly Dictionary<string,string> data = new();
     private readonly LinkedList<string> lruList = new();
-    private readonly object lockobj = new();
+    private readonly object lockObj = new();
 
     public ArtCache(int maxSize)
     {
@@ -16,7 +16,7 @@ public class ArtCache
 
     public bool TryGet(string key, out string value)
     {
-        lock (lockobj)
+        lock (lockObj)
         {
             if(data.TryGetValue(key,out value))
             {
@@ -31,7 +31,7 @@ public class ArtCache
 
     public void Add(string key, string value)
     {
-        lock (lockobj)
+        lock (lockObj)
         {
             if (!data.ContainsKey(key))
             {
