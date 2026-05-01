@@ -1,6 +1,6 @@
 # Build results
-[Bb]in/
-[Ob]j/
+**/[Bb]in/
+**/[Ob]j/
 
 # Visual Studio cache and settings
 .vs/
