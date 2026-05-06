@@ -1,6 +1,4 @@
-using System.Collections.Generic;
 using System.Net;
-using System.Threading;
 
 namespace SistemskoProjekat;
 
@@ -14,20 +12,31 @@ public class RequestQueue
         lock (lockobj)
         {
             queue.Enqueue(context);
-            Monitor.Pulse(lockobj);
+            Monitor.Pulse(lockobj); // budi jednu nit koja ceka
         }
     }
 
-    public HttpListenerContext Dequeue()
+    public void WakeUpAll()
     {
         lock (lockobj)
         {
-            while(queue.Count == 0)
+            Monitor.PulseAll(lockobj); // budi sve niti radi gasenja
+        }
+    }
+
+    public HttpListenerContext Dequeue(ref bool isRunning)
+    {
+        lock (lockobj)
+        {
+            while (queue.Count == 0 && isRunning)
             {
-                Monitor.Wait(lockobj);
+                Monitor.Wait(lockobj); // ceka signal ili gasenje
             }
 
-            return queue.Dequeue();
+            if (queue.Count > 0)
+                return queue.Dequeue();
+            
+            return null; // vraca null ako se server gasi
         }
     }
 }

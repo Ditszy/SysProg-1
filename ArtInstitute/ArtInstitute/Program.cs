@@ -1,115 +1,207 @@
-﻿using System;
-using System.Net;
-using System.Threading;
-using System.Collections.Generic;
-using System.Net.Http;
+﻿using System.Net;
+using System.Collections.Concurrent;
 using System.Text.Json;
-using System.Threading.Tasks;
+using System.Diagnostics;
 
 namespace SistemskoProjekat;
 
 class Program
 {
-    private static readonly ArtCache cache = new ArtCache(10); 
+    private static readonly ArtCache cache = new ArtCache(10,TimeSpan.FromMinutes(30));
     private static readonly RequestQueue requestQueue = new RequestQueue();
     private static readonly HttpClient httpClient = new HttpClient();
-    private static readonly object consoleLock = new object();
+    private static readonly List<Thread> workers = new List<Thread>();
+    private static readonly ConcurrentDictionary<string, object> queryLocks = new();
+
+    private static volatile bool isRunning = true;
+    private static HttpListener? listener;
 
     static void Main(string[] args)
     {
-        const int numThreads = 5;
+        const int numThreads = 10;
         httpClient.DefaultRequestHeaders.Add("User-Agent", "SistemskoProjekat");
-        for(int i = 0; i < numThreads; i++)
+
+        Console.CancelKeyPress += (sender, e) => {
+            e.Cancel = true;
+            Logger.Log("Gasenje servera inicirano");
+            isRunning = false;
+
+            requestQueue.WakeUpAll();
+            listener?.Abort();
+        };
+
+        for (int i = 0; i < numThreads; i++)
         {
             Thread worker = new Thread(WorkerLoop);
-            worker.IsBackground = true;
             worker.Start();
+            workers.Add(worker);
         }
 
-        HttpListener listener = new HttpListener();
+        listener = new HttpListener();
         listener.Prefixes.Add("http://localhost:8080/");
         
         try {
             listener.Start();
-            Console.WriteLine("Server pokrenut na http://localhost:8080/");
+            Logger.Log("Server pokrenut na http://localhost:8080/");
 
-            while (true)
+            while (isRunning)
             {
                 var context = listener.GetContext();
                 requestQueue.Enqueue(context);
             }
         }
+        catch (HttpListenerException) {
+            Logger.Log("Listener zaustavljen");
+        }
         catch (Exception ex) {
-            Log($"Greška: {ex.Message}");
+            if (isRunning) Logger.Log($"Greska: {ex.Message}");
+        }
+        finally {
+            foreach (var t in workers) {
+                if (!t.Join(2000)){
+                    Logger.Log($"Nit {t.ManagedThreadId} se nije ugasila na vreme.");
+                }
+            }
+            
+            listener?.Close();
+            Logger.Log("Sistem ugasen");
         }
     }
 
     private static void WorkerLoop()
     {
-        while (true)
+        while (isRunning)
         {
-            var context = requestQueue.Dequeue();
-            ProcessRequest(context);
-        }
-    }
-
-    private static void SendResponse(HttpListenerContext context, string body, HttpStatusCode status)
-    {
-        try {
-            context.Response.StatusCode = (int)status;
-            context.Response.ContentType = "application/json";
-            using var writer = new StreamWriter(context.Response.OutputStream);
-            writer.Write(body);
-        }
-        catch (Exception ex) {
-            Log($"Greška pri slanju: {ex.Message}");
-        }
-    }
-
-    private static async Task<string> FetchFromApi(string query)
-    {
-        string url = $"https://api.artic.edu/api/v1/artworks/search?q={query}";
-        try {
-            return await httpClient.GetStringAsync(url);
-        }
-        catch {
-            return "{\"error\": \"Problem sa Art Institute API\"}";
+            var context = requestQueue.Dequeue(ref isRunning);
+            
+            if (context != null) 
+            {
+                try {
+                    ProcessRequest(context);
+                }
+                catch (Exception ex) {
+                    Logger.Log($"Greska u obradi: {ex.Message}");
+                }
+            }
         }
     }
 
     private static void ProcessRequest(HttpListenerContext context)
     {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         string query = context.Request.QueryString["q"];
-        if (string.IsNullOrEmpty(query))
+        string author = context.Request.QueryString["author"];
+
+        bool hasQuery = !string.IsNullOrWhiteSpace(query);
+        bool hasAuthor = !string.IsNullOrWhiteSpace(author);
+        
+        if (!hasQuery && !hasAuthor)
         {
-            SendResponse(context,"{\"error\": \"Nedostaje q parametar\"}",HttpStatusCode.BadRequest);
+            SendResponse(context, "{\"error\": \"Prosledi parametar\"}", HttpStatusCode.BadRequest);
             return;
         }
 
-        if(!cache.TryGet(query,out string result))
+        string searchType = hasAuthor ? "author" : "q";
+        string searchValue = NormalizeInput(hasAuthor ? author : query);
+        string cacheKey = $"{searchType}:{searchValue}";
+        string source = "Cache hit";
+
+        if (!cache.TryGet(cacheKey, out string result))
         {
-            lock (string.Intern(query))
+            var queryLock = queryLocks.GetOrAdd(cacheKey, _ => new object());
+            lock (queryLock)
             {
-                if (!cache.TryGet(query, out result))
+                if (!cache.TryGet(cacheKey, out result))
                 {
-                    Log($"API poziv za: {query}");
-                    result = FetchFromApi(query).GetAwaiter().GetResult();
-                    cache.Add(query, result);
+                    result = FetchFromApi(searchType, searchValue);
+                    cache.Add(cacheKey, result);
+                    sw.Stop();
+                    Logger.Log($"API poziv ({searchType}): {searchValue}, Vreme: {sw.Elapsed.TotalMilliseconds}ms");
+                }
+                else
+                {
+                    sw.Stop();
+                    Logger.Log($"Stampedo ({searchType}): {searchValue}, Vreme: {sw.Elapsed.TotalMilliseconds}ms");
                 }
             }
+            queryLocks.TryRemove(cacheKey, out _);
         }
-        else
+        else{
+
+            sw.Stop();
+            Logger.Log($"Cache hit ({searchType}): {searchValue}, Vreme: {sw.Elapsed.TotalMilliseconds}ms");
+        }
+        
+
+        if (IsEmptyArtworkResult(result))
         {
-            Log($"Rezultat iz keša za: {query}");
+            SendResponse(context, "{\"error\": \"Umetnicka dela nisu pronadjena\"}", HttpStatusCode.NotFound);
+            return;
         }
 
-        SendResponse(context,result,HttpStatusCode.OK);
+        SendResponse(context, result, HttpStatusCode.OK);
     }
 
-    public static void Log(string message)
+    private static string FetchFromApi(string searchType, string searchValue)
     {
-        lock (consoleLock) {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [Nit {Thread.CurrentThread.ManagedThreadId}] {message}");
+        string url = BuildApiUrl(searchType, searchValue);
+        try
+        {
+            return httpClient.GetStringAsync(url).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"Greska pri mreznom pozivu: {ex.Message}");
+            return "{\"error\": \"API greska\"}";
+        }
+    }
+
+    private static string BuildApiUrl(string searchType, string searchValue)
+    {
+        string encodedValue = Uri.EscapeDataString(searchValue);
+        if (searchType == "author")
+        {
+            return $"https://api.artic.edu/api/v1/artworks/search?query[term][artist_title]={encodedValue}";
+        }
+
+        return $"https://api.artic.edu/api/v1/artworks/search?q={encodedValue}";
+    }
+
+    private static string NormalizeInput(string value)
+    {
+        return value.Trim().ToLowerInvariant();
+    }
+
+    private static bool IsEmptyArtworkResult(string responseBody)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(responseBody);
+            if (!document.RootElement.TryGetProperty("data", out var dataElement))
+            {
+                return false;
+            }
+
+            return dataElement.ValueKind == JsonValueKind.Array && dataElement.GetArrayLength() == 0;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static void SendResponse(HttpListenerContext context, string body, HttpStatusCode status)
+    {
+        try
+        {
+            context.Response.StatusCode = (int)status;
+            context.Response.ContentType = "application/json";
+            using var writer = new StreamWriter(context.Response.OutputStream);
+            writer.Write(body);
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"Greska pri slanju odgovora: {ex.Message}");
         }
     }
 }

@@ -1,54 +1,124 @@
+using System;
 using System.Collections.Generic;
-
-namespace SistemskoProjekat;
+using System.Linq;
+using System.Threading;
 
 public class ArtCache
 {
-    private readonly int maxSize;
-    private readonly Dictionary<string,string> data = new();
-    private readonly LinkedList<string> lruList = new();
-    private readonly object lockObj = new();
+    // Unutrašnja klasa koja čuva podatak i njegov "timestamp" (vremenski pečat)
+    private class CacheEntry
+    {
+        public string Value { get; set; }
+        public LinkedListNode<string> Node { get; }
+        public DateTime CreatedAt { get; }
 
-    public ArtCache(int maxSize)
+        public CacheEntry(string value, LinkedListNode<string> node)
+        {
+            Value = value;
+            Node = node;
+            CreatedAt = DateTime.Now;
+        }
+    }
+
+    private readonly int maxSize;
+    private readonly TimeSpan maxLifeTime;
+    private readonly Dictionary<string, CacheEntry> data;
+    private readonly LinkedList<string> lruList;
+    private readonly object lockObj = new object();
+    private readonly Thread cleanupThread;
+    private bool isRunning = true;
+
+    public ArtCache(int maxSize, TimeSpan maxLifeTime)
     {
         this.maxSize = maxSize;
+        this.maxLifeTime = maxLifeTime;
+        data = new Dictionary<string, CacheEntry>();
+        lruList = new LinkedList<string>();
+
+        cleanupThread = new Thread(BackgroundCleanup);
+        cleanupThread.IsBackground = true;
+        cleanupThread.Start();
     }
 
     public bool TryGet(string key, out string value)
     {
         lock (lockObj)
         {
-            if(data.TryGetValue(key,out value))
+            if (data.TryGetValue(key, out var entry))
             {
-                //Pomeramo na pocetak liste jer je recently used
-                lruList.Remove(key); 
-                lruList.AddFirst(key);
+
+                lruList.Remove(entry.Node);
+                lruList.AddFirst(entry.Node);
+                
+                value = entry.Value;
                 return true;
             }
-            return false;
         }
+        value = null;
+        return false;
     }
 
     public void Add(string key, string value)
     {
         lock (lockObj)
         {
-            if (!data.ContainsKey(key))
+            if (data.TryGetValue(key, out var existingEntry))
             {
-                if(data.Count >= maxSize)
+                existingEntry.Value = value;
+                lruList.Remove(existingEntry.Node);
+                lruList.AddFirst(existingEntry.Node);
+                return;
+            }
+
+            if (data.Count >= maxSize)
+            {
+                var oldestKey = lruList.Last.Value;
+                if (data.TryGetValue(oldestKey, out var toRemove))
                 {
-                    //Izbacujemo najstarijeg tj poslednjeg u listi
-                    var najstariji = lruList.Last.Value; 
-                    data.Remove(najstariji);
-                    lruList.RemoveLast();
+                    RemoveEntry(oldestKey, toRemove);
                 }
-                data.Add(key,value);
             }
-            else
+
+            var newNode = new LinkedListNode<string>(key);
+            lruList.AddFirst(newNode);
+            data[key] = new CacheEntry(value, newNode);
+        }
+    }
+
+    private void RemoveEntry(string key, CacheEntry entry)
+    {
+        lruList.Remove(entry.Node);
+        data.Remove(key);
+    }
+
+    private void BackgroundCleanup()
+    {
+        while (isRunning)
+        {
+            Thread.Sleep(TimeSpan.FromHours(1));
+
+            lock (lockObj)
             {
-                lruList.Remove(key);
+                DateTime now = DateTime.Now;
+                
+                var keysToRemove = data
+                    .Where(pair => now - pair.Value.CreatedAt > maxLifeTime)
+                    .Select(pair => pair.Key)
+                    .ToList();
+
+                if (keysToRemove.Any())
+                {
+                    Console.WriteLine($"\n[Cleanup Thread] Izbacujem {keysToRemove.Count} zastarelih elemenata...");
+                    
+                    foreach (var key in keysToRemove)
+                    {
+                        if (data.TryGetValue(key, out var entry))
+                        {
+                            RemoveEntry(key, entry);
+                        }
+                    }
+                }
             }
-            lruList.AddFirst(key);
         }
     }
 }
