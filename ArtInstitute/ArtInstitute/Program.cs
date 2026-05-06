@@ -10,11 +10,12 @@ class Program
     private static readonly ArtCache cache = new ArtCache(10,TimeSpan.FromMinutes(30));
     private static readonly RequestQueue requestQueue = new RequestQueue();
     private static readonly HttpClient httpClient = new HttpClient();
-    private static readonly List<Thread> workers = new List<Thread>();
     private static readonly ConcurrentDictionary<string, object> queryLocks = new();
+    private static readonly ManualResetEventSlim workersDone = new(true);
 
     private static volatile bool isRunning = true;
     private static HttpListener? listener;
+    private static int activeWorkers;
 
     static void Main(string[] args)
     {
@@ -30,11 +31,13 @@ class Program
             listener?.Abort();
         };
 
+        ThreadPool.SetMinThreads(numThreads, numThreads);
+        activeWorkers = numThreads;
+        workersDone.Reset();
+
         for (int i = 0; i < numThreads; i++)
         {
-            Thread worker = new Thread(WorkerLoop);
-            worker.Start();
-            workers.Add(worker);
+            ThreadPool.QueueUserWorkItem(_ => WorkerLoop());
         }
 
         listener = new HttpListener();
@@ -57,10 +60,8 @@ class Program
             if (isRunning) Logger.Log($"Greska: {ex.Message}");
         }
         finally {
-            foreach (var t in workers) {
-                if (!t.Join(2000)){
-                    Logger.Log($"Nit {t.ManagedThreadId} se nije ugasila na vreme.");
-                }
+            if (!workersDone.Wait(2000)) {
+                Logger.Log("ThreadPool radnici se nisu ugasili na vreme.");
             }
             
             listener?.Close();
@@ -70,18 +71,28 @@ class Program
 
     private static void WorkerLoop()
     {
-        while (isRunning)
+        try
         {
-            var context = requestQueue.Dequeue(ref isRunning);
-            
-            if (context != null) 
+            while (isRunning)
             {
-                try {
-                    ProcessRequest(context);
+                var context = requestQueue.Dequeue(ref isRunning);
+                
+                if (context != null) 
+                {
+                    try {
+                        ProcessRequest(context);
+                    }
+                    catch (Exception ex) {
+                        Logger.Log($"Greska u obradi: {ex.Message}");
+                    }
                 }
-                catch (Exception ex) {
-                    Logger.Log($"Greska u obradi: {ex.Message}");
-                }
+            }
+        }
+        finally
+        {
+            if (Interlocked.Decrement(ref activeWorkers) == 0)
+            {
+                workersDone.Set();
             }
         }
     }

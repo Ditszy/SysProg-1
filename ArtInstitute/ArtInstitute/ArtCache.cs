@@ -25,8 +25,7 @@ public class ArtCache
     private readonly Dictionary<string, CacheEntry> data;
     private readonly LinkedList<string> lruList;
     private readonly object lockObj = new object();
-    private readonly Thread cleanupThread;
-    private bool isRunning = true;
+    private readonly Timer cleanupTimer;
 
     public ArtCache(int maxSize, TimeSpan maxLifeTime)
     {
@@ -35,9 +34,11 @@ public class ArtCache
         data = new Dictionary<string, CacheEntry>();
         lruList = new LinkedList<string>();
 
-        cleanupThread = new Thread(BackgroundCleanup);
-        cleanupThread.IsBackground = true;
-        cleanupThread.Start();
+        cleanupTimer = new Timer(
+            BackgroundCleanup,
+            null,
+            TimeSpan.FromHours(1),
+            TimeSpan.FromHours(1));
     }
 
     public bool TryGet(string key, out string value)
@@ -91,31 +92,26 @@ public class ArtCache
         data.Remove(key);
     }
 
-    private void BackgroundCleanup()
+    private void BackgroundCleanup(object? state)
     {
-        while (isRunning)
+        lock (lockObj)
         {
-            Thread.Sleep(TimeSpan.FromHours(1));
+            DateTime now = DateTime.Now;
+            
+            var keysToRemove = data
+                .Where(pair => now - pair.Value.CreatedAt > maxLifeTime)
+                .Select(pair => pair.Key)
+                .ToList();
 
-            lock (lockObj)
+            if (keysToRemove.Any())
             {
-                DateTime now = DateTime.Now;
+                Console.WriteLine($"\n[Cleanup Thread] Izbacujem {keysToRemove.Count} zastarelih elemenata...");
                 
-                var keysToRemove = data
-                    .Where(pair => now - pair.Value.CreatedAt > maxLifeTime)
-                    .Select(pair => pair.Key)
-                    .ToList();
-
-                if (keysToRemove.Any())
+                foreach (var key in keysToRemove)
                 {
-                    Console.WriteLine($"\n[Cleanup Thread] Izbacujem {keysToRemove.Count} zastarelih elemenata...");
-                    
-                    foreach (var key in keysToRemove)
+                    if (data.TryGetValue(key, out var entry))
                     {
-                        if (data.TryGetValue(key, out var entry))
-                        {
-                            RemoveEntry(key, entry);
-                        }
+                        RemoveEntry(key, entry);
                     }
                 }
             }
