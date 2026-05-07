@@ -5,7 +5,6 @@ using System.Threading;
 
 public class ArtCache
 {
-    // Unutrašnja klasa koja čuva podatak i njegov "timestamp" (vremenski pečat)
     private class CacheEntry
     {
         public string Value { get; set; }

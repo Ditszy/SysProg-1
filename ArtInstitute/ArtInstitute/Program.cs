@@ -8,18 +8,17 @@ namespace SistemskoProjekat;
 class Program
 {
     private static readonly ArtCache cache = new ArtCache(10,TimeSpan.FromMinutes(30));
-    private static readonly RequestQueue requestQueue = new RequestQueue();
     private static readonly HttpClient httpClient = new HttpClient();
     private static readonly ConcurrentDictionary<string, object> queryLocks = new();
-    private static readonly ManualResetEventSlim workersDone = new(true);
+    private static readonly object dispatchLock = new object();
 
     private static volatile bool isRunning = true;
     private static HttpListener? listener;
-    private static int activeWorkers;
+    private static int inFlightRequests;
+    private const int maxParallelRequests = 10;
 
     static void Main(string[] args)
     {
-        const int numThreads = 10;
         httpClient.DefaultRequestHeaders.Add("User-Agent", "SistemskoProjekat");
 
         Console.CancelKeyPress += (sender, e) => {
@@ -27,18 +26,10 @@ class Program
             Logger.Log("Gasenje servera inicirano");
             isRunning = false;
 
-            requestQueue.WakeUpAll();
             listener?.Abort();
         };
 
-        ThreadPool.SetMinThreads(numThreads, numThreads);
-        activeWorkers = numThreads;
-        workersDone.Reset();
-
-        for (int i = 0; i < numThreads; i++)
-        {
-            ThreadPool.QueueUserWorkItem(_ => WorkerLoop());
-        }
+        ThreadPool.SetMinThreads(maxParallelRequests, maxParallelRequests);
 
         listener = new HttpListener();
         listener.Prefixes.Add("http://localhost:8080/");
@@ -50,7 +41,15 @@ class Program
             while (isRunning)
             {
                 var context = listener.GetContext();
-                requestQueue.Enqueue(context);
+                WaitForFreeSlot();
+                if (!isRunning)
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.ServiceUnavailable;
+                    context.Response.Close();
+                    break;
+                }
+
+                ThreadPool.QueueUserWorkItem(state => ProcessQueuedRequest((HttpListenerContext)state!), context);
             }
         }
         catch (HttpListenerException) {
@@ -60,8 +59,12 @@ class Program
             if (isRunning) Logger.Log($"Greska: {ex.Message}");
         }
         finally {
-            if (!workersDone.Wait(2000)) {
-                Logger.Log("ThreadPool radnici se nisu ugasili na vreme.");
+            lock (dispatchLock)
+            {
+                while (inFlightRequests > 0)
+                {
+                    Monitor.Wait(dispatchLock);
+                }
             }
             
             listener?.Close();
@@ -69,37 +72,45 @@ class Program
         }
     }
 
-    private static void WorkerLoop()
+    private static void WaitForFreeSlot()
+    {
+        lock (dispatchLock)
+        {
+            while (inFlightRequests >= maxParallelRequests && isRunning)
+            {
+                Monitor.Wait(dispatchLock);
+            }
+
+            if (isRunning)
+                inFlightRequests++;
+        }
+    }
+
+    private static void ProcessQueuedRequest(HttpListenerContext context)
     {
         try
         {
-            while (isRunning)
-            {
-                var context = requestQueue.Dequeue(ref isRunning);
-                
-                if (context != null) 
-                {
-                    try {
-                        ProcessRequest(context);
-                    }
-                    catch (Exception ex) {
-                        Logger.Log($"Greska u obradi: {ex.Message}");
-                    }
-                }
-            }
+            ProcessRequest(context);
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"Greska u obradi: {ex.Message}");
         }
         finally
         {
-            if (Interlocked.Decrement(ref activeWorkers) == 0)
+            context.Response.Close();
+
+            lock (dispatchLock)
             {
-                workersDone.Set();
+                inFlightRequests--;
+                Monitor.Pulse(dispatchLock);
             }
         }
     }
 
     private static void ProcessRequest(HttpListenerContext context)
     {
-        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var sw = Stopwatch.StartNew();
         string query = context.Request.QueryString["q"];
         string author = context.Request.QueryString["author"];
 
@@ -115,7 +126,6 @@ class Program
         string searchType = hasAuthor ? "author" : "q";
         string searchValue = NormalizeInput(hasAuthor ? author : query);
         string cacheKey = $"{searchType}:{searchValue}";
-        string source = "Cache hit";
 
         if (!cache.TryGet(cacheKey, out string result))
         {
@@ -134,8 +144,9 @@ class Program
                     sw.Stop();
                     Logger.Log($"Stampedo ({searchType}): {searchValue}, Vreme: {sw.Elapsed.TotalMilliseconds}ms");
                 }
+
+                queryLocks.TryRemove(cacheKey, out _);
             }
-            queryLocks.TryRemove(cacheKey, out _);
         }
         else{
 
