@@ -18,7 +18,7 @@ class Program
 
     static void Main(string[] args)
     {
-        const int numThreads = 10;
+        const int numThreads = 16;
         httpClient.DefaultRequestHeaders.Add("User-Agent", "SistemskoProjekat");
 
         Console.CancelKeyPress += (sender, e) => {
@@ -123,8 +123,9 @@ class Program
                     sw.Stop();
                     Logger.Log($"Stampedo ({searchType}): {searchValue}, Vreme: {sw.Elapsed.TotalMilliseconds}ms");
                 }
+                queryLocks.TryRemove(cacheKey, out _);
             }
-            queryLocks.TryRemove(cacheKey, out _);
+            
         }
         else{
 
