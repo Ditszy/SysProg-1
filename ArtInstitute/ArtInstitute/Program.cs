@@ -15,7 +15,7 @@ class Program
     private static volatile bool isRunning = true;
     private static HttpListener? listener;
     private static int inFlightRequests;
-    private const int maxParallelRequests = 10;
+    private const int maxParallelRequests = 16;
 
     static void Main(string[] args)
     {
